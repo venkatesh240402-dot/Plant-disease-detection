@@ -1,0 +1,1 @@
+class IdentityService:\n    pass
