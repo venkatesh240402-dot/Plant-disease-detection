@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'dart:async';
+import 'dart:ui';
 import '../offline/offline_inference.dart';
+import 'api_client.dart';
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -13,15 +16,9 @@ class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
   bool _isProcessing = false;
   DetectionResult? _currentResult;
-  final OfflineInference _inference = OfflineInference();
+  bool _isFlashOn = false;
   
-  // Production Temporal Smoothing: Requires 4 out of last 5 frames to agree
-  final List<DetectionResult?> _predictionHistory = [];
-  static const int _historySize = 5;
-  static const int _consensusThreshold = 4;
-  
-  // Throttle to ~6.5 FPS (150ms) for fast consensus building
-  DateTime _lastFrameTime = DateTime.now();
+  Timer? _scanTimer;
 
   @override
   void initState() {
@@ -30,10 +27,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initializeCameraAndModels() async {
-    // 1. Initialize models
-    await _inference.initializeModels();
-
-    // 2. Initialize camera
+    // 1. Initialize camera
     final cameras = await availableCameras();
     if (cameras.isEmpty) {
       debugPrint("No cameras available.");
@@ -48,17 +42,20 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _controller = CameraController(
       backCamera,
-      ResolutionPreset.medium,
+      ResolutionPreset.high,
       enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.jpeg,
     );
 
     try {
       await _controller!.initialize();
+      await _controller!.setFlashMode(FlashMode.off);
       if (!mounted) return;
 
-      _controller!.startImageStream((CameraImage image) {
+      // Start scanning every 1 second — _isProcessing guard prevents overlapping requests
+      _scanTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!_isProcessing) {
-          _processCameraFrame(image);
+          _captureAndDetect();
         }
       });
 
@@ -68,74 +65,38 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  Future<void> _processCameraFrame(CameraImage image) async {
-    final now = DateTime.now();
-    if (now.difference(_lastFrameTime).inMilliseconds < 150) {
-      return; // Skip frame to maintain ~6.5 fps
-    }
-    _lastFrameTime = now;
+  Future<void> _captureAndDetect() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
     
     _isProcessing = true;
-
     try {
-      final result = await _inference.processFrame(image);
-     
-      if (mounted) {
-        setState(() {
-          // 1. Add current frame result to rolling history (null if confidence is low)
-          if (result != null && result.confidence > 0.70) {
-            _predictionHistory.add(result);
-          } else {
-            _predictionHistory.add(null);
-          }
-          
-          // 2. Keep queue size strictly at limit
-          if (_predictionHistory.length > _historySize) {
-            _predictionHistory.removeAt(0);
-          }
-
-          // 3. Count occurrences of each disease in recent memory
-          final diseaseCounts = <String, int>{};
-          for (var r in _predictionHistory) {
-            if (r != null) {
-              diseaseCounts[r.disease] = (diseaseCounts[r.disease] ?? 0) + 1;
-            }
-          }
-
-          // 4. Check if any disease has achieved consensus
-          String? consensusDisease;
-          for (var entry in diseaseCounts.entries) {
-            if (entry.value >= _consensusThreshold) {
-              consensusDisease = entry.key;
-              break;
-            }
-          }
-
-          // 5. Update UI based on consensus
-          if (consensusDisease != null) {
-             // Consensus reached! Lock it into the UI with the highest confidence read
-             _currentResult = _predictionHistory
-                .where((r) => r != null && r.disease == consensusDisease)
-                .reduce((a, b) => a!.confidence > b!.confidence ? a : b);
-          } else {
-             // No consensus - user is likely panning or looking at background noise
-             _currentResult = null;
-          }
-        });
-      }
+       final xFile = await _controller!.takePicture();
+       final bytes = await xFile.readAsBytes();
+       
+       final result = await ApiClient.detectDisease(bytes);
+       
+       if (mounted) {
+           setState(() {
+               if (result != null && result.confidence > 0.40) {
+                  _currentResult = result;
+               } else {
+                  _currentResult = null;
+               }
+           });
+       }
     } catch (e) {
-      debugPrint('Error processing frame: $e');
+       debugPrint('Error capturing frame: $e');
     } finally {
-      if (mounted) {
-        _isProcessing = false;
-      }
+       if (mounted) {
+           _isProcessing = false;
+       }
     }
   }
 
   @override
   void dispose() {
+    _scanTimer?.cancel();
     _controller?.dispose();
-    _inference.dispose();
     super.dispose();
   }
 
@@ -154,6 +115,19 @@ class _CameraScreenState extends State<CameraScreen> {
         title: const Text('Plant Disease Scanner'),
         backgroundColor: Colors.green.shade700,
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: Icon(_isFlashOn ? Icons.flash_on : Icons.flash_off),
+            onPressed: () {
+              setState(() {
+                _isFlashOn = !_isFlashOn;
+                _controller?.setFlashMode(
+                  _isFlashOn ? FlashMode.torch : FlashMode.off,
+                );
+              });
+            },
+          ),
+        ],
       ),
       body: Stack(
         fit: StackFit.expand,
@@ -179,13 +153,29 @@ class _CameraScreenState extends State<CameraScreen> {
             
           // Target reticle
           Center(
-            child: Container(
-              width: 250,
-              height: 250,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.greenAccent, width: 2),
-                borderRadius: BorderRadius.circular(16),
-              ),
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 1.0, end: _isProcessing ? 1.1 : 1.0),
+              duration: const Duration(milliseconds: 500),
+              curve: Curves.easeInOutBack,
+              builder: (context, scale, child) {
+                return Transform.scale(
+                  scale: scale,
+                  child: Container(
+                    width: 250,
+                    height: 250,
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: _isProcessing ? Colors.yellowAccent : Colors.greenAccent, 
+                        width: _isProcessing ? 4 : 2
+                      ),
+                      borderRadius: BorderRadius.circular(24),
+                      boxShadow: _isProcessing ? [
+                        BoxShadow(color: Colors.yellowAccent.withOpacity(0.3), blurRadius: 20, spreadRadius: 5)
+                      ] : [],
+                    ),
+                  ),
+                );
+              },
             ),
           )
         ],
@@ -194,103 +184,162 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Widget _buildResultCard() {
-    return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.95),
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: const [
-            BoxShadow(
-              color: Colors.black26,
-              blurRadius: 10,
-              offset: Offset(0, 4),
-            ),
-          ],
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Expanded(
-                  child: Text(
-                    "Crop: ${_currentResult!.crop.toUpperCase()}",
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.green.shade800,
+    bool isHealthy = _currentResult!.disease.toLowerCase() == 'healthy';
+    Color statusColor = isHealthy ? const Color(0xFF4CAF50) : const Color(0xFFE53935);
+    Color statusBg = isHealthy ? const Color(0xFF1B5E20) : const Color(0xFF7F0000);
+    IconData statusIcon = isHealthy ? Icons.check_circle_rounded : Icons.coronavirus_rounded;
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(24),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.75),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: statusColor.withOpacity(0.5), width: 1.5),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Crop row
+              Row(
+                children: [
+                  const Icon(Icons.eco_rounded, color: Colors.greenAccent, size: 18),
+                  const SizedBox(width: 8),
+                  Text(
+                    "CROP: ${_currentResult!.crop.toUpperCase()}",
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.greenAccent,
+                      letterSpacing: 1.5,
                     ),
                   ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: _currentResult!.disease == 'Healthy'
-                        ? Colors.green.shade100
-                        : Colors.red.shade100,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    "${(_currentResult!.confidence * 100).toStringAsFixed(1)}%",
-                    style: TextStyle(
-                      color: _currentResult!.disease == 'Healthy'
-                          ? Colors.green.shade900
-                          : Colors.red.shade900,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              "Status: ${_currentResult!.disease}",
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-                color: _currentResult!.disease == 'Healthy'
-                    ? Colors.green.shade700
-                    : Colors.red.shade700,
+                ],
               ),
-            ),
-            const Divider(),
-            const Text(
-              "Recommended Solution:",
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              _currentResult!.solution,
-              style: const TextStyle(fontSize: 14, color: Colors.black87),
-            ),
-          ],
+              const SizedBox(height: 10),
+              // Disease — the biggest, most prominent element
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: statusBg.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: statusColor, width: 1.5),
+                ),
+                child: Row(
+                  children: [
+                    Icon(statusIcon, color: statusColor, size: 26),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            isHealthy ? "HEALTHY" : "DISEASE DETECTED",
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: statusColor,
+                              letterSpacing: 1.5,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            _currentResult!.disease,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Solution
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.lightbulb_outline, color: Colors.amber, size: 16),
+                        SizedBox(width: 6),
+                        Text(
+                          "RECOMMENDATION",
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.amber,
+                            letterSpacing: 1.4,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _currentResult!.solution,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.white,
+                        height: 1.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
-      );
+      ),
+    );
   }
 
   Widget _buildWaitingCard() {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
-      decoration: BoxDecoration(
-        color: Colors.black87,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: const Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.camera_alt, color: Colors.white70),
-          SizedBox(width: 12),
-          Text(
-            "Point camera clearly at a leaf...",
-            style: TextStyle(
-              fontSize: 16,
-              color: Colors.white,
-              fontWeight: FontWeight.w500,
-            ),
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.5),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white24, width: 1),
           ),
-        ],
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _isProcessing 
+                ? const SizedBox(
+                    width: 20, height: 20, 
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.yellowAccent)
+                  )
+                : const Icon(Icons.camera_alt, color: Colors.white70),
+              const SizedBox(width: 12),
+              Text(
+                _isProcessing ? "AI is analyzing leaf..." : "Point camera clearly at a leaf...",
+                style: TextStyle(
+                  fontSize: 16,
+                  color: _isProcessing ? Colors.yellowAccent : Colors.white,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
